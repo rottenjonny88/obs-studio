@@ -3,7 +3,7 @@
 #
 #  FFMPEG_FOUND - All required components and the core library were found
 #  FFMPEG_INCLUDE_DIRS - Combined list of all components include dirs
-#  FFMPEG_LIBRARIES - Combined list of all componenets libraries
+#  FFMPEG_LIBRARIES - Combined list of all components libraries
 #  FFMPEG_VERSION_STRING - Version of the first component requested
 #
 # For each requested component the following variables are defined:
@@ -49,6 +49,8 @@ function(find_ffmpeg_library component header)
 			${DepsPath${_lib_suffix}}
 			${DepsPath}
 			${PC_FFMPEG_${component}_INCLUDE_DIRS}
+		PATHS
+			/usr/include /usr/local/include /opt/local/include /sw/include
 		PATH_SUFFIXES ffmpeg libav include)
 
 	find_library(FFMPEG_${component}_LIBRARY
@@ -64,6 +66,8 @@ function(find_ffmpeg_library component header)
 			${DepsPath${_lib_suffix}}
 			${DepsPath}
 			${PC_FFMPEG_${component}_LIBRARY_DIRS}
+		PATHS
+			/usr/lib /usr/local/lib /opt/local/lib /sw/lib
 		PATH_SUFFIXES
 			lib${_lib_suffix} lib
 			libs${_lib_suffix} libs

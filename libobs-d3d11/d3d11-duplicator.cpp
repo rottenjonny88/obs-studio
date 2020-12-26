@@ -16,24 +16,14 @@
 ******************************************************************************/
 
 #include "d3d11-subsystem.hpp"
+#include <unordered_map>
 
 static inline bool get_monitor(gs_device_t *device, int monitor_idx,
-		IDXGIOutput **dxgiOutput)
+			       IDXGIOutput **dxgiOutput)
 {
-	ComPtr<IDXGIAdapter> dxgiAdapter;
-	ComPtr<IDXGIDevice> dxgiDevice;
 	HRESULT hr;
 
-	hr = device->device->QueryInterface(__uuidof(IDXGIDevice),
-			(void**)dxgiDevice.Assign());
-	if (FAILED(hr))
-		throw HRError("Failed to query IDXGIDevice", hr);
-
-	hr = dxgiDevice->GetAdapter(dxgiAdapter.Assign());
-	if (FAILED(hr))
-		throw HRError("Failed to get adapter", hr);
-
-	hr = dxgiAdapter->EnumOutputs(monitor_idx, dxgiOutput);
+	hr = device->adapter->EnumOutputs(monitor_idx, dxgiOutput);
 	if (FAILED(hr)) {
 		if (hr == DXGI_ERROR_NOT_FOUND)
 			return false;
@@ -44,24 +34,33 @@ static inline bool get_monitor(gs_device_t *device, int monitor_idx,
 	return true;
 }
 
-gs_duplicator::gs_duplicator(gs_device_t *device_, int monitor_idx)
-	: texture(nullptr), device(device_)
+void gs_duplicator::Start()
 {
 	ComPtr<IDXGIOutput1> output1;
 	ComPtr<IDXGIOutput> output;
 	HRESULT hr;
 
-	if (!get_monitor(device, monitor_idx, output.Assign()))
+	if (!get_monitor(device, idx, output.Assign()))
 		throw "Invalid monitor index";
 
 	hr = output->QueryInterface(__uuidof(IDXGIOutput1),
-			(void**)output1.Assign());
+				    (void **)output1.Assign());
 	if (FAILED(hr))
 		throw HRError("Failed to query IDXGIOutput1", hr);
 
 	hr = output1->DuplicateOutput(device->device, duplicator.Assign());
 	if (FAILED(hr))
 		throw HRError("Failed to duplicate output", hr);
+}
+
+gs_duplicator::gs_duplicator(gs_device_t *device_, int monitor_idx)
+	: gs_obj(device_, gs_type::gs_duplicator),
+	  texture(nullptr),
+	  idx(monitor_idx),
+	  refs(1),
+	  updated(false)
+{
+	Start();
 }
 
 gs_duplicator::~gs_duplicator()
@@ -72,7 +71,8 @@ gs_duplicator::~gs_duplicator()
 extern "C" {
 
 EXPORT bool device_get_duplicator_monitor_info(gs_device_t *device,
-		int monitor_idx, struct gs_monitor_info *info)
+					       int monitor_idx,
+					       struct gs_monitor_info *info)
 {
 	DXGI_OUTPUT_DESC desc;
 	HRESULT hr;
@@ -87,9 +87,11 @@ EXPORT bool device_get_duplicator_monitor_info(gs_device_t *device,
 		if (FAILED(hr))
 			throw HRError("GetDesc failed", hr);
 
-	} catch (HRError error) {
-		blog(LOG_ERROR, "device_get_duplicator_monitor_info: "
-		                "%s (%08lX)", error.str, error.hr);
+	} catch (const HRError &error) {
+		blog(LOG_ERROR,
+		     "device_get_duplicator_monitor_info: "
+		     "%s (%08lX)",
+		     error.str, error.hr);
 		return false;
 	}
 
@@ -120,22 +122,38 @@ EXPORT bool device_get_duplicator_monitor_info(gs_device_t *device,
 	return true;
 }
 
+static std::unordered_map<int, gs_duplicator *> instances;
+
+void reset_duplicators(void)
+{
+	for (std::pair<const int, gs_duplicator *> &pair : instances) {
+		pair.second->updated = false;
+	}
+}
+
 EXPORT gs_duplicator_t *device_duplicator_create(gs_device_t *device,
-		int monitor_idx)
+						 int monitor_idx)
 {
 	gs_duplicator *duplicator = nullptr;
 
+	const auto it = instances.find(monitor_idx);
+	if (it != instances.end()) {
+		duplicator = it->second;
+		duplicator->refs++;
+		return duplicator;
+	}
+
 	try {
 		duplicator = new gs_duplicator(device, monitor_idx);
+		instances[monitor_idx] = duplicator;
 
 	} catch (const char *error) {
-		blog(LOG_DEBUG, "device_duplicator_create: %s",
-				error);
+		blog(LOG_DEBUG, "device_duplicator_create: %s", error);
 		return nullptr;
 
-	} catch (HRError error) {
+	} catch (const HRError &error) {
 		blog(LOG_DEBUG, "device_duplicator_create: %s (%08lX)",
-				error.str, error.hr);
+		     error.str, error.hr);
 		return nullptr;
 	}
 
@@ -144,7 +162,10 @@ EXPORT gs_duplicator_t *device_duplicator_create(gs_device_t *device,
 
 EXPORT void gs_duplicator_destroy(gs_duplicator_t *duplicator)
 {
-	delete duplicator;
+	if (--duplicator->refs == 0) {
+		instances.erase(duplicator->idx);
+		delete duplicator;
+	}
 }
 
 static inline void copy_texture(gs_duplicator_t *d, ID3D11Texture2D *tex)
@@ -152,20 +173,17 @@ static inline void copy_texture(gs_duplicator_t *d, ID3D11Texture2D *tex)
 	D3D11_TEXTURE2D_DESC desc;
 	tex->GetDesc(&desc);
 
-	if (!d->texture ||
-	    d->texture->width != desc.Width ||
+	if (!d->texture || d->texture->width != desc.Width ||
 	    d->texture->height != desc.Height) {
 
 		delete d->texture;
-		d->texture = (gs_texture_2d*)gs_texture_create(
-				desc.Width, desc.Height,
-				ConvertDXGITextureFormat(desc.Format), 1,
-				nullptr, 0);
+		d->texture = (gs_texture_2d *)gs_texture_create(
+			desc.Width, desc.Height,
+			ConvertDXGITextureFormat(desc.Format), 1, nullptr, 0);
 	}
 
 	if (!!d->texture)
-		d->device->context->CopyResource(d->texture->texture,
-				tex);
+		d->device->context->CopyResource(d->texture->texture, tex);
 }
 
 EXPORT bool gs_duplicator_update_frame(gs_duplicator_t *d)
@@ -175,6 +193,13 @@ EXPORT bool gs_duplicator_update_frame(gs_duplicator_t *d)
 	ComPtr<IDXGIResource> res;
 	HRESULT hr;
 
+	if (!d->duplicator) {
+		return false;
+	}
+	if (d->updated) {
+		return true;
+	}
+
 	hr = d->duplicator->AcquireNextFrame(0, &info, res.Assign());
 	if (hr == DXGI_ERROR_ACCESS_LOST) {
 		return false;
@@ -183,22 +208,27 @@ EXPORT bool gs_duplicator_update_frame(gs_duplicator_t *d)
 		return true;
 
 	} else if (FAILED(hr)) {
-		blog(LOG_ERROR, "gs_duplicator_update_frame: Failed to update "
-		                "frame (%08lX)", hr);
+		blog(LOG_ERROR,
+		     "gs_duplicator_update_frame: Failed to update "
+		     "frame (%08lX)",
+		     hr);
 		return true;
 	}
 
 	hr = res->QueryInterface(__uuidof(ID3D11Texture2D),
-			(void**)tex.Assign());
+				 (void **)tex.Assign());
 	if (FAILED(hr)) {
-		blog(LOG_ERROR, "gs_duplicator_update_frame: Failed to query "
-		               "ID3D11Texture2D (%08lX)", hr);
+		blog(LOG_ERROR,
+		     "gs_duplicator_update_frame: Failed to query "
+		     "ID3D11Texture2D (%08lX)",
+		     hr);
 		d->duplicator->ReleaseFrame();
 		return true;
 	}
 
 	copy_texture(d, tex);
 	d->duplicator->ReleaseFrame();
+	d->updated = true;
 	return true;
 }
 
@@ -206,5 +236,4 @@ EXPORT gs_texture_t *gs_duplicator_get_texture(gs_duplicator_t *duplicator)
 {
 	return duplicator->texture;
 }
-
 }

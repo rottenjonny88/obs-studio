@@ -9,6 +9,10 @@ set(inject-helper_SOURCES
 	../obfuscate.c
 	inject-helper.c)
 
+if(MSVC)
+	add_compile_options($<IF:$<CONFIG:Debug>,/MTd,/MT>)
+endif()
+
 add_executable(inject-helper
 	${inject-helper_SOURCES})
 
@@ -22,6 +26,7 @@ endif()
 
 set_target_properties(inject-helper
 	PROPERTIES
+		FOLDER "plugins/win-capture"
 		OUTPUT_NAME "inject-helper${_output_suffix}")
 
 install_obs_datatarget(inject-helper "obs-plugins/win-capture")

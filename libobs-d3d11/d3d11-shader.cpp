@@ -23,7 +23,7 @@
 #include <graphics/matrix4.h>
 
 void gs_vertex_shader::GetBuffersExpected(
-		const vector<D3D11_INPUT_ELEMENT_DESC> &inputs)
+	const vector<D3D11_INPUT_ELEMENT_DESC> &inputs)
 {
 	for (size_t i = 0; i < inputs.size(); i++) {
 		const D3D11_INPUT_ELEMENT_DESC &input = inputs[i];
@@ -39,51 +39,57 @@ void gs_vertex_shader::GetBuffersExpected(
 }
 
 gs_vertex_shader::gs_vertex_shader(gs_device_t *device, const char *file,
-		const char *shaderString)
-	: gs_shader   (device, GS_SHADER_VERTEX),
-	  hasNormals  (false),
-	  hasColors   (false),
-	  hasTangents (false),
-	  nTexUnits   (0)
+				   const char *shaderString)
+	: gs_shader(device, gs_type::gs_vertex_shader, GS_SHADER_VERTEX),
+	  hasNormals(false),
+	  hasColors(false),
+	  hasTangents(false),
+	  nTexUnits(0)
 {
-	vector<D3D11_INPUT_ELEMENT_DESC> inputs;
-	ShaderProcessor    processor(device);
+	ShaderProcessor processor(device);
 	ComPtr<ID3D10Blob> shaderBlob;
-	string             outputString;
-	HRESULT            hr;
+	string outputString;
+	HRESULT hr;
 
 	processor.Process(shaderString, file);
 	processor.BuildString(outputString);
 	processor.BuildParams(params);
-	processor.BuildInputLayout(inputs);
-	GetBuffersExpected(inputs);
+	processor.BuildInputLayout(layoutData);
+	GetBuffersExpected(layoutData);
 	BuildConstantBuffer();
 
 	Compile(outputString.c_str(), file, "vs_4_0", shaderBlob.Assign());
 
-	hr = device->device->CreateVertexShader(shaderBlob->GetBufferPointer(),
-			shaderBlob->GetBufferSize(), NULL, shader.Assign());
+	data.resize(shaderBlob->GetBufferSize());
+	memcpy(&data[0], shaderBlob->GetBufferPointer(), data.size());
+
+	hr = device->device->CreateVertexShader(data.data(), data.size(), NULL,
+						shader.Assign());
 	if (FAILED(hr))
 		throw HRError("Failed to create vertex shader", hr);
 
-	hr = device->device->CreateInputLayout(inputs.data(),
-			(UINT)inputs.size(), shaderBlob->GetBufferPointer(),
-			shaderBlob->GetBufferSize(), layout.Assign());
-	if (FAILED(hr))
-		throw HRError("Failed to create input layout", hr);
+	const UINT layoutSize = (UINT)layoutData.size();
+	if (layoutSize > 0) {
+		hr = device->device->CreateInputLayout(layoutData.data(),
+						       (UINT)layoutSize,
+						       data.data(), data.size(),
+						       layout.Assign());
+		if (FAILED(hr))
+			throw HRError("Failed to create input layout", hr);
+	}
 
 	viewProj = gs_shader_get_param_by_name(this, "ViewProj");
-	world    = gs_shader_get_param_by_name(this, "World");
+	world = gs_shader_get_param_by_name(this, "World");
 }
 
 gs_pixel_shader::gs_pixel_shader(gs_device_t *device, const char *file,
-		const char *shaderString)
-	: gs_shader(device, GS_SHADER_PIXEL)
+				 const char *shaderString)
+	: gs_shader(device, gs_type::gs_pixel_shader, GS_SHADER_PIXEL)
 {
-	ShaderProcessor    processor(device);
+	ShaderProcessor processor(device);
 	ComPtr<ID3D10Blob> shaderBlob;
-	string             outputString;
-	HRESULT            hr;
+	string outputString;
+	HRESULT hr;
 
 	processor.Process(shaderString, file);
 	processor.BuildString(outputString);
@@ -93,10 +99,13 @@ gs_pixel_shader::gs_pixel_shader(gs_device_t *device, const char *file,
 
 	Compile(outputString.c_str(), file, "ps_4_0", shaderBlob.Assign());
 
-	hr = device->device->CreatePixelShader(shaderBlob->GetBufferPointer(),
-			shaderBlob->GetBufferSize(), NULL, shader.Assign());
+	data.resize(shaderBlob->GetBufferSize());
+	memcpy(&data[0], shaderBlob->GetBufferPointer(), data.size());
+
+	hr = device->device->CreatePixelShader(data.data(), data.size(), NULL,
+					       shader.Assign());
 	if (FAILED(hr))
-		throw HRError("Failed to create vertex shader", hr);
+		throw HRError("Failed to create pixel shader", hr);
 }
 
 /*
@@ -126,23 +135,37 @@ void gs_shader::BuildConstantBuffer()
 {
 	for (size_t i = 0; i < params.size(); i++) {
 		gs_shader_param &param = params[i];
-		size_t       size   = 0;
+		size_t size = 0;
 
 		switch (param.type) {
 		case GS_SHADER_PARAM_BOOL:
 		case GS_SHADER_PARAM_INT:
-		case GS_SHADER_PARAM_FLOAT:     size = sizeof(float);   break;
-		case GS_SHADER_PARAM_VEC2:      size = sizeof(vec2);    break;
-		case GS_SHADER_PARAM_VEC3:      size = sizeof(float)*3; break;
-		case GS_SHADER_PARAM_VEC4:      size = sizeof(vec4);    break;
+		case GS_SHADER_PARAM_FLOAT:
+			size = sizeof(float);
+			break;
+		case GS_SHADER_PARAM_INT2:
+		case GS_SHADER_PARAM_VEC2:
+			size = sizeof(vec2);
+			break;
+		case GS_SHADER_PARAM_INT3:
+		case GS_SHADER_PARAM_VEC3:
+			size = sizeof(float) * 3;
+			break;
+		case GS_SHADER_PARAM_INT4:
+		case GS_SHADER_PARAM_VEC4:
+			size = sizeof(vec4);
+			break;
 		case GS_SHADER_PARAM_MATRIX4X4:
-			size = sizeof(float)*4*4;
+			size = sizeof(float) * 4 * 4;
 			break;
 		case GS_SHADER_PARAM_TEXTURE:
 		case GS_SHADER_PARAM_STRING:
 		case GS_SHADER_PARAM_UNKNOWN:
 			continue;
 		}
+
+		if (param.arrayCount)
+			size *= param.arrayCount;
 
 		/* checks to see if this constant needs to start at a new
 		 * register */
@@ -153,22 +176,22 @@ void gs_shader::BuildConstantBuffer()
 				constantSize = alignMax;
 		}
 
-		param.pos     = constantSize;
+		param.pos = constantSize;
 		constantSize += size;
 	}
 
+	memset(&bd, 0, sizeof(bd));
+
 	if (constantSize) {
-		D3D11_BUFFER_DESC bd;
 		HRESULT hr;
 
-		memset(&bd, 0, sizeof(bd));
-		bd.ByteWidth      = (constantSize+15)&0xFFFFFFF0; /* align */
-		bd.Usage          = D3D11_USAGE_DYNAMIC;
-		bd.BindFlags      = D3D11_BIND_CONSTANT_BUFFER;
+		bd.ByteWidth = (constantSize + 15) & 0xFFFFFFF0; /* align */
+		bd.Usage = D3D11_USAGE_DYNAMIC;
+		bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
 		bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
 
 		hr = device->device->CreateBuffer(&bd, NULL,
-				constants.Assign());
+						  constants.Assign());
 		if (FAILED(hr))
 			throw HRError("Failed to create constant buffer", hr);
 	}
@@ -178,7 +201,7 @@ void gs_shader::BuildConstantBuffer()
 }
 
 void gs_shader::Compile(const char *shaderString, const char *file,
-		const char *target, ID3D10Blob **shader)
+			const char *target, ID3D10Blob **shader)
 {
 	ComPtr<ID3D10Blob> errorsBlob;
 	HRESULT hr;
@@ -187,19 +210,36 @@ void gs_shader::Compile(const char *shaderString, const char *file,
 		throw "No shader string specified";
 
 	hr = device->d3dCompile(shaderString, strlen(shaderString), file, NULL,
-			NULL, "main", target,
-			D3D10_SHADER_OPTIMIZATION_LEVEL1, 0,
-			shader, errorsBlob.Assign());
+				NULL, "main", target,
+				D3D10_SHADER_OPTIMIZATION_LEVEL1, 0, shader,
+				errorsBlob.Assign());
 	if (FAILED(hr)) {
 		if (errorsBlob != NULL && errorsBlob->GetBufferSize())
 			throw ShaderError(errorsBlob, hr);
 		else
 			throw HRError("Failed to compile shader", hr);
 	}
+
+#ifdef DISASSEMBLE_SHADERS
+	ComPtr<ID3D10Blob> asmBlob;
+
+	if (!device->d3dDisassemble)
+		return;
+
+	hr = device->d3dDisassemble((*shader)->GetBufferPointer(),
+				    (*shader)->GetBufferSize(), 0, nullptr,
+				    &asmBlob);
+
+	if (SUCCEEDED(hr) && !!asmBlob && asmBlob->GetBufferSize()) {
+		blog(LOG_INFO, "=============================================");
+		blog(LOG_INFO, "Disassembly output for shader '%s':\n%s", file,
+		     asmBlob->GetBufferPointer());
+	}
+#endif
 }
 
 inline void gs_shader::UpdateParam(vector<uint8_t> &constData,
-		gs_shader_param &param, bool &upload)
+				   gs_shader_param &param, bool &upload)
 {
 	if (param.type != GS_SHADER_PARAM_TEXTURE) {
 		if (!param.curValue.size())
@@ -208,30 +248,29 @@ inline void gs_shader::UpdateParam(vector<uint8_t> &constData,
 		/* padding in case the constant needs to start at a new
 		 * register */
 		if (param.pos > constData.size()) {
-			uint8_t zero  = 0;
+			uint8_t zero = 0;
 
 			constData.insert(constData.end(),
-					param.pos - constData.size(), zero);
+					 param.pos - constData.size(), zero);
 		}
 
-		constData.insert(constData.end(),
-				param.curValue.begin(),
-				param.curValue.end());
+		constData.insert(constData.end(), param.curValue.begin(),
+				 param.curValue.end());
 
 		if (param.changed) {
 			upload = true;
 			param.changed = false;
 		}
 
-	} else if (param.curValue.size() == sizeof(gs_texture_t*)) {
+	} else if (param.curValue.size() == sizeof(gs_texture_t *)) {
 		gs_texture_t *tex;
-		memcpy(&tex, param.curValue.data(), sizeof(gs_texture_t*));
+		memcpy(&tex, param.curValue.data(), sizeof(gs_texture_t *));
 		device_load_texture(device, tex, param.textureID);
 
 		if (param.nextSampler) {
 			ID3D11SamplerState *state = param.nextSampler->state;
 			device->context->PSSetSamplers(param.textureID, 1,
-					&state);
+						       &state);
 			param.nextSampler = nullptr;
 		}
 	}
@@ -240,7 +279,7 @@ inline void gs_shader::UpdateParam(vector<uint8_t> &constData,
 void gs_shader::UploadParams()
 {
 	vector<uint8_t> constData;
-	bool            upload = false;
+	bool upload = false;
 
 	constData.reserve(constantSize);
 
@@ -255,7 +294,7 @@ void gs_shader::UploadParams()
 		HRESULT hr;
 
 		hr = device->context->Map(constants, 0, D3D11_MAP_WRITE_DISCARD,
-				0, &map);
+					  0, &map);
 		if (FAILED(hr))
 			throw HRError("Could not lock constant buffer", hr);
 
@@ -266,6 +305,8 @@ void gs_shader::UploadParams()
 
 void gs_shader_destroy(gs_shader_t *shader)
 {
+	if (shader && shader->device->lastVertexShader == shader)
+		shader->device->lastVertexShader = nullptr;
 	delete shader;
 }
 
@@ -295,7 +336,7 @@ gs_sparam_t *gs_shader_get_viewproj_matrix(const gs_shader_t *shader)
 	if (shader->type != GS_SHADER_VERTEX)
 		return NULL;
 
-	return static_cast<const gs_vertex_shader*>(shader)->viewProj;
+	return static_cast<const gs_vertex_shader *>(shader)->viewProj;
 }
 
 gs_sparam_t *gs_shader_get_world_matrix(const gs_shader_t *shader)
@@ -303,11 +344,11 @@ gs_sparam_t *gs_shader_get_world_matrix(const gs_shader_t *shader)
 	if (shader->type != GS_SHADER_VERTEX)
 		return NULL;
 
-	return static_cast<const gs_vertex_shader*>(shader)->world;
+	return static_cast<const gs_vertex_shader *>(shader)->world;
 }
 
 void gs_shader_get_param_info(const gs_sparam_t *param,
-		struct gs_shader_param_info *info)
+			      struct gs_shader_param_info *info)
 {
 	if (!param)
 		return;
@@ -317,7 +358,7 @@ void gs_shader_get_param_info(const gs_sparam_t *param,
 }
 
 static inline void shader_setval_inline(gs_shader_param *param,
-		const void *data, size_t size)
+					const void *data, size_t size)
 {
 	assert(param);
 	if (!param)
@@ -378,7 +419,7 @@ void gs_shader_set_vec4(gs_sparam_t *param, const struct vec4 *val)
 
 void gs_shader_set_texture(gs_sparam_t *param, gs_texture_t *val)
 {
-	shader_setval_inline(param, &val, sizeof(gs_texture_t*));
+	shader_setval_inline(param, &val, sizeof(gs_texture_t *));
 }
 
 void gs_shader_set_val(gs_sparam_t *param, const void *val, size_t size)
@@ -390,7 +431,7 @@ void gs_shader_set_default(gs_sparam_t *param)
 {
 	if (param->defaultValue.size())
 		shader_setval_inline(param, param->defaultValue.data(),
-				param->defaultValue.size());
+				     param->defaultValue.size());
 }
 
 void gs_shader_set_next_sampler(gs_sparam_t *param, gs_samplerstate_t *sampler)

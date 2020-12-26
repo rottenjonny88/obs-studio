@@ -18,6 +18,7 @@
 #include <stdio.h>
 #include <wchar.h>
 #include "config-file.h"
+#include "threading.h"
 #include "platform.h"
 #include "base.h"
 #include "bmem.h"
@@ -47,7 +48,7 @@ static inline void config_section_free(struct config_section *section)
 	size_t i;
 
 	for (i = 0; i < section->items.num; i++)
-		config_item_free(items+i);
+		config_item_free(items + i);
 
 	darray_free(&section->items);
 	bfree(section->name);
@@ -57,7 +58,18 @@ struct config_data {
 	char *file;
 	struct darray sections; /* struct config_section */
 	struct darray defaults; /* struct config_section */
+	pthread_mutex_t mutex;
 };
+
+static inline bool init_mutex(config_t *config)
+{
+	pthread_mutexattr_t attr;
+	if (pthread_mutexattr_init(&attr) != 0)
+		return false;
+	if (pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE) != 0)
+		return false;
+	return pthread_mutex_init(&config->mutex, &attr) == 0;
+}
 
 config_t *config_create(const char *file)
 {
@@ -70,6 +82,12 @@ config_t *config_create(const char *file)
 	fclose(f);
 
 	config = bzalloc(sizeof(struct config_data));
+
+	if (!init_mutex(config)) {
+		bfree(config);
+		return NULL;
+	}
+
 	config->file = bstrdup(file);
 	return config;
 }
@@ -77,18 +95,17 @@ config_t *config_create(const char *file)
 static inline void remove_ref_whitespace(struct strref *ref)
 {
 	if (ref->array) {
-		while (is_whitespace(*ref->array)) {
+		while (ref->len && is_whitespace(*ref->array)) {
 			ref->array++;
 			ref->len--;
 		}
 
-		while (ref->len && is_whitespace(ref->array[ref->len-1]))
+		while (ref->len && is_whitespace(ref->array[ref->len - 1]))
 			ref->len--;
 	}
 }
 
-static bool config_parse_string(struct lexer *lex, struct strref *ref,
-		char end)
+static bool config_parse_string(struct lexer *lex, struct strref *ref, char end)
 {
 	bool success = end != 0;
 	struct base_token token;
@@ -113,7 +130,7 @@ static bool config_parse_string(struct lexer *lex, struct strref *ref,
 		strref_add(ref, &token.text);
 	}
 
-	remove_ref_whitespace(ref);
+	//remove_ref_whitespace(ref);
 	return success;
 }
 
@@ -131,7 +148,7 @@ static void unescape(struct dstr *str)
 			} else if (next == 'r') {
 				cur = '\r';
 				read++;
-			} else if (next =='n') {
+			} else if (next == 'n') {
 				cur = '\n';
 				read++;
 			}
@@ -146,7 +163,7 @@ static void unescape(struct dstr *str)
 }
 
 static void config_add_item(struct darray *items, struct strref *name,
-		struct strref *value)
+			    struct strref *value)
 {
 	struct config_item item;
 	struct dstr item_value;
@@ -154,13 +171,13 @@ static void config_add_item(struct darray *items, struct strref *name,
 
 	unescape(&item_value);
 
-	item.name  = bstrdup_n(name->array,  name->len);
+	item.name = bstrdup_n(name->array, name->len);
 	item.value = item_value.array;
 	darray_push_back(sizeof(struct config_item), items, &item);
 }
 
 static void config_parse_section(struct config_section *section,
-		struct lexer *lex)
+				 struct lexer *lex)
 {
 	struct base_token token;
 
@@ -175,8 +192,9 @@ static void config_parse_section(struct config_section *section,
 		if (token.type == BASETOKEN_OTHER) {
 			if (*token.text.array == '#') {
 				do {
-					if (!lexer_getbasetoken(lex, &token,
-							PARSE_WHITESPACE))
+					if (!lexer_getbasetoken(
+						    lex, &token,
+						    PARSE_WHITESPACE))
 						return;
 				} while (!is_newline(*token.text.array));
 
@@ -194,8 +212,15 @@ static void config_parse_section(struct config_section *section,
 		strref_clear(&value);
 		config_parse_string(lex, &value, 0);
 
-		if (!strref_is_empty(&value))
+		if (strref_is_empty(&value)) {
+			struct config_item item;
+			item.name = bstrdup_n(name.array, name.len);
+			item.value = bzalloc(1);
+			darray_push_back(sizeof(struct config_item),
+					 &section->items, &item);
+		} else {
 			config_add_item(&section->items, &name, &value);
+		}
 	}
 }
 
@@ -230,15 +255,14 @@ static void parse_config_data(struct darray *sections, struct lexer *lex)
 			return;
 
 		section = darray_push_back_new(sizeof(struct config_section),
-				sections);
-		section->name = bstrdup_n(section_name.array,
-				section_name.len);
+					       sections);
+		section->name = bstrdup_n(section_name.array, section_name.len);
 		config_parse_section(section, lex);
 	}
 }
 
 static int config_parse_file(struct darray *sections, const char *file,
-		bool always_open)
+			     bool always_open)
 {
 	char *file_data;
 	struct lexer lex;
@@ -278,6 +302,11 @@ int config_open(config_t **config, const char *file,
 	if (!*config)
 		return CONFIG_ERROR;
 
+	if (!init_mutex(*config)) {
+		bfree(*config);
+		return CONFIG_ERROR;
+	}
+
 	(*config)->file = bstrdup(file);
 
 	errorcode = config_parse_file(&(*config)->sections, file, always_open);
@@ -300,6 +329,11 @@ int config_open_string(config_t **config, const char *str)
 	*config = bzalloc(sizeof(struct config_data));
 	if (!*config)
 		return CONFIG_ERROR;
+
+	if (!init_mutex(*config)) {
+		bfree(*config);
+		return CONFIG_ERROR;
+	}
 
 	(*config)->file = NULL;
 
@@ -324,6 +358,7 @@ int config_save(config_t *config)
 	FILE *f;
 	struct dstr str, tmp;
 	size_t i, j;
+	int ret = CONFIG_ERROR;
 
 	if (!config)
 		return CONFIG_ERROR;
@@ -333,16 +368,20 @@ int config_save(config_t *config)
 	dstr_init(&str);
 	dstr_init(&tmp);
 
+	pthread_mutex_lock(&config->mutex);
+
 	f = os_fopen(config->file, "wb");
-	if (!f)
+	if (!f) {
+		pthread_mutex_unlock(&config->mutex);
 		return CONFIG_FILENOTFOUND;
+	}
 
 	for (i = 0; i < config->sections.num; i++) {
 		struct config_section *section = darray_item(
-				sizeof(struct config_section),
-				&config->sections, i);
+			sizeof(struct config_section), &config->sections, i);
 
-		if (i) dstr_cat(&str, "\n");
+		if (i)
+			dstr_cat(&str, "\n");
 
 		dstr_cat(&str, "[");
 		dstr_cat(&str, section->name);
@@ -350,8 +389,7 @@ int config_save(config_t *config)
 
 		for (j = 0; j < section->items.num; j++) {
 			struct config_item *item = darray_item(
-					sizeof(struct config_item),
-					&section->items, j);
+				sizeof(struct config_item), &section->items, j);
 
 			dstr_copy(&tmp, item->value ? item->value : "");
 			dstr_replace(&tmp, "\\", "\\\\");
@@ -366,19 +404,27 @@ int config_save(config_t *config)
 	}
 
 #ifdef _WIN32
-	fwrite("\xEF\xBB\xBF", 1, 3, f);
+	if (fwrite("\xEF\xBB\xBF", 3, 1, f) != 1)
+		goto cleanup;
 #endif
-	fwrite(str.array, 1, str.len, f);
+	if (fwrite(str.array, str.len, 1, f) != 1)
+		goto cleanup;
+
+	ret = CONFIG_SUCCESS;
+
+cleanup:
 	fclose(f);
+
+	pthread_mutex_unlock(&config->mutex);
 
 	dstr_free(&tmp);
 	dstr_free(&str);
 
-	return CONFIG_SUCCESS;
+	return ret;
 }
 
 int config_save_safe(config_t *config, const char *temp_ext,
-		const char *backup_ext)
+		     const char *backup_ext)
 {
 	struct dstr temp_file = {0};
 	struct dstr backup_file = {0};
@@ -387,9 +433,11 @@ int config_save_safe(config_t *config, const char *temp_ext,
 
 	if (!temp_ext || !*temp_ext) {
 		blog(LOG_ERROR, "config_save_safe: invalid "
-		                "temporary extension specified");
+				"temporary extension specified");
 		return CONFIG_ERROR;
 	}
+
+	pthread_mutex_lock(&config->mutex);
 
 	dstr_copy(&temp_file, config->file);
 	if (*temp_ext != '.')
@@ -401,6 +449,10 @@ int config_save_safe(config_t *config, const char *temp_ext,
 	config->file = file;
 
 	if (ret != CONFIG_SUCCESS) {
+		blog(LOG_ERROR,
+		     "config_save_safe: failed to "
+		     "write to %s",
+		     temp_file.array);
 		goto cleanup;
 	}
 
@@ -409,16 +461,13 @@ int config_save_safe(config_t *config, const char *temp_ext,
 		if (*backup_ext != '.')
 			dstr_cat(&backup_file, ".");
 		dstr_cat(&backup_file, backup_ext);
-
-		os_unlink(backup_file.array);
-		os_rename(file, backup_file.array);
-	} else {
-		os_unlink(file);
 	}
 
-	os_rename(temp_file.array, file);
+	if (os_safe_replace(file, temp_file.array, backup_file.array) != 0)
+		ret = CONFIG_ERROR;
 
 cleanup:
+	pthread_mutex_unlock(&config->mutex);
 	dstr_free(&temp_file);
 	dstr_free(&backup_file);
 	return ret;
@@ -429,19 +478,21 @@ void config_close(config_t *config)
 	struct config_section *defaults, *sections;
 	size_t i;
 
-	if (!config) return;
+	if (!config)
+		return;
 
 	defaults = config->defaults.array;
 	sections = config->sections.array;
 
 	for (i = 0; i < config->defaults.num; i++)
-		config_section_free(defaults+i);
+		config_section_free(defaults + i);
 	for (i = 0; i < config->sections.num; i++)
-		config_section_free(sections+i);
+		config_section_free(sections + i);
 
 	darray_free(&config->defaults);
 	darray_free(&config->sections);
 	bfree(config->file);
+	pthread_mutex_destroy(&config->mutex);
 	bfree(config);
 }
 
@@ -453,30 +504,37 @@ size_t config_num_sections(config_t *config)
 const char *config_get_section(config_t *config, size_t idx)
 {
 	struct config_section *section;
+	const char *name = NULL;
+
+	pthread_mutex_lock(&config->mutex);
 
 	if (idx >= config->sections.num)
-		return NULL;
+		goto unlock;
 
 	section = darray_item(sizeof(struct config_section), &config->sections,
-			idx);
+			      idx);
+	name = section->name;
 
-	return section->name;
+unlock:
+	pthread_mutex_unlock(&config->mutex);
+	return name;
 }
 
 static const struct config_item *config_find_item(const struct darray *sections,
-		const char *section, const char *name)
+						  const char *section,
+						  const char *name)
 {
 	size_t i, j;
 
 	for (i = 0; i < sections->num; i++) {
-		const struct config_section *sec = darray_item(
-				sizeof(struct config_section), sections, i);
+		const struct config_section *sec =
+			darray_item(sizeof(struct config_section), sections, i);
 
 		if (astrcmpi(sec->name, section) == 0) {
 			for (j = 0; j < sec->items.num; j++) {
-				struct config_item *item = darray_item(
-						sizeof(struct config_item),
-						&sec->items, j);
+				struct config_item *item =
+					darray_item(sizeof(struct config_item),
+						    &sec->items, j);
 
 				if (astrcmpi(item->name, name) == 0)
 					return item;
@@ -487,26 +545,28 @@ static const struct config_item *config_find_item(const struct darray *sections,
 	return NULL;
 }
 
-static void config_set_item(struct darray *sections, const char *section,
-		const char *name, char *value)
+static void config_set_item(config_t *config, struct darray *sections,
+			    const char *section, const char *name, char *value)
 {
 	struct config_section *sec = NULL;
 	struct config_section *array = sections->array;
 	struct config_item *item;
 	size_t i, j;
 
+	pthread_mutex_lock(&config->mutex);
+
 	for (i = 0; i < sections->num; i++) {
-		struct config_section *cur_sec = array+i;
+		struct config_section *cur_sec = array + i;
 		struct config_item *items = cur_sec->items.array;
 
 		if (astrcmpi(cur_sec->name, section) == 0) {
 			for (j = 0; j < cur_sec->items.num; j++) {
-				item = items+j;
+				item = items + j;
 
 				if (astrcmpi(item->name, name) == 0) {
 					bfree(item->value);
 					item->value = value;
-					return;
+					goto unlock;
 				}
 			}
 
@@ -517,109 +577,119 @@ static void config_set_item(struct darray *sections, const char *section,
 
 	if (!sec) {
 		sec = darray_push_back_new(sizeof(struct config_section),
-				sections);
+					   sections);
 		sec->name = bstrdup(section);
 	}
 
 	item = darray_push_back_new(sizeof(struct config_item), &sec->items);
-	item->name  = bstrdup(name);
+	item->name = bstrdup(name);
 	item->value = value;
+
+unlock:
+	pthread_mutex_unlock(&config->mutex);
 }
 
-void config_set_string(config_t *config, const char *section,
-		const char *name, const char *value)
+void config_set_string(config_t *config, const char *section, const char *name,
+		       const char *value)
 {
 	if (!value)
 		value = "";
-	config_set_item(&config->sections, section, name, bstrdup(value));
+	config_set_item(config, &config->sections, section, name,
+			bstrdup(value));
 }
 
-void config_set_int(config_t *config, const char *section,
-		const char *name, int64_t value)
+void config_set_int(config_t *config, const char *section, const char *name,
+		    int64_t value)
 {
 	struct dstr str;
 	dstr_init(&str);
-	dstr_printf(&str, "%"PRId64, value);
-	config_set_item(&config->sections, section, name, str.array);
+	dstr_printf(&str, "%" PRId64, value);
+	config_set_item(config, &config->sections, section, name, str.array);
 }
 
-void config_set_uint(config_t *config, const char *section,
-		const char *name, uint64_t value)
+void config_set_uint(config_t *config, const char *section, const char *name,
+		     uint64_t value)
 {
 	struct dstr str;
 	dstr_init(&str);
-	dstr_printf(&str, "%"PRIu64, value);
-	config_set_item(&config->sections, section, name, str.array);
+	dstr_printf(&str, "%" PRIu64, value);
+	config_set_item(config, &config->sections, section, name, str.array);
 }
 
-void config_set_bool(config_t *config, const char *section,
-		const char *name, bool value)
+void config_set_bool(config_t *config, const char *section, const char *name,
+		     bool value)
 {
 	char *str = bstrdup(value ? "true" : "false");
-	config_set_item(&config->sections, section, name, str);
+	config_set_item(config, &config->sections, section, name, str);
 }
 
-void config_set_double(config_t *config, const char *section,
-		const char *name, double value)
+void config_set_double(config_t *config, const char *section, const char *name,
+		       double value)
 {
 	char *str = bzalloc(64);
 	os_dtostr(value, str, 64);
-	config_set_item(&config->sections, section, name, str);
+	config_set_item(config, &config->sections, section, name, str);
 }
 
 void config_set_default_string(config_t *config, const char *section,
-		const char *name, const char *value)
+			       const char *name, const char *value)
 {
 	if (!value)
 		value = "";
-	config_set_item(&config->defaults, section, name, bstrdup(value));
+	config_set_item(config, &config->defaults, section, name,
+			bstrdup(value));
 }
 
 void config_set_default_int(config_t *config, const char *section,
-		const char *name, int64_t value)
+			    const char *name, int64_t value)
 {
 	struct dstr str;
 	dstr_init(&str);
-	dstr_printf(&str, "%"PRId64, value);
-	config_set_item(&config->defaults, section, name, str.array);
+	dstr_printf(&str, "%" PRId64, value);
+	config_set_item(config, &config->defaults, section, name, str.array);
 }
 
 void config_set_default_uint(config_t *config, const char *section,
-		const char *name, uint64_t value)
+			     const char *name, uint64_t value)
 {
 	struct dstr str;
 	dstr_init(&str);
-	dstr_printf(&str, "%"PRIu64, value);
-	config_set_item(&config->defaults, section, name, str.array);
+	dstr_printf(&str, "%" PRIu64, value);
+	config_set_item(config, &config->defaults, section, name, str.array);
 }
 
 void config_set_default_bool(config_t *config, const char *section,
-		const char *name, bool value)
+			     const char *name, bool value)
 {
 	char *str = bstrdup(value ? "true" : "false");
-	config_set_item(&config->defaults, section, name, str);
+	config_set_item(config, &config->defaults, section, name, str);
 }
 
 void config_set_default_double(config_t *config, const char *section,
-		const char *name, double value)
+			       const char *name, double value)
 {
 	struct dstr str;
 	dstr_init(&str);
 	dstr_printf(&str, "%g", value);
-	config_set_item(&config->defaults, section, name, str.array);
+	config_set_item(config, &config->defaults, section, name, str.array);
 }
 
-const char *config_get_string(const config_t *config, const char *section,
-		const char *name)
+const char *config_get_string(config_t *config, const char *section,
+			      const char *name)
 {
-	const struct config_item *item = config_find_item(&config->sections,
-			section, name);
+	const struct config_item *item;
+	const char *value = NULL;
+
+	pthread_mutex_lock(&config->mutex);
+
+	item = config_find_item(&config->sections, section, name);
 	if (!item)
 		item = config_find_item(&config->defaults, section, name);
-	if (!item)
-		return NULL;
+	if (item)
+		value = item->value;
 
-	return item->value;
+	pthread_mutex_unlock(&config->mutex);
+	return value;
 }
 
 static inline int64_t str_to_int64(const char *str)
@@ -644,8 +714,7 @@ static inline uint64_t str_to_uint64(const char *str)
 		return strtoull(str, NULL, 10);
 }
 
-int64_t config_get_int(const config_t *config, const char *section,
-		const char *name)
+int64_t config_get_int(config_t *config, const char *section, const char *name)
 {
 	const char *value = config_get_string(config, section, name);
 	if (value)
@@ -654,8 +723,8 @@ int64_t config_get_int(const config_t *config, const char *section,
 	return 0;
 }
 
-uint64_t config_get_uint(const config_t *config, const char *section,
-		const char *name)
+uint64_t config_get_uint(config_t *config, const char *section,
+			 const char *name)
 {
 	const char *value = config_get_string(config, section, name);
 	if (value)
@@ -664,19 +733,17 @@ uint64_t config_get_uint(const config_t *config, const char *section,
 	return 0;
 }
 
-bool config_get_bool(const config_t *config, const char *section,
-		const char *name)
+bool config_get_bool(config_t *config, const char *section, const char *name)
 {
 	const char *value = config_get_string(config, section, name);
 	if (value)
-		return astrcmpi(value, "true") == 0 ||
-		       !!str_to_uint64(value);
+		return astrcmpi(value, "true") == 0 || !!str_to_uint64(value);
 
 	return false;
 }
 
-double config_get_double(const config_t *config, const char *section,
-		const char *name)
+double config_get_double(config_t *config, const char *section,
+			 const char *name)
 {
 	const char *value = config_get_string(config, section, name);
 	if (value)
@@ -686,48 +753,57 @@ double config_get_double(const config_t *config, const char *section,
 }
 
 bool config_remove_value(config_t *config, const char *section,
-		const char *name)
+			 const char *name)
 {
 	struct darray *sections = &config->sections;
+	bool success = false;
+
+	pthread_mutex_lock(&config->mutex);
 
 	for (size_t i = 0; i < sections->num; i++) {
-		struct config_section *sec = darray_item(
-				sizeof(struct config_section), sections, i);
+		struct config_section *sec =
+			darray_item(sizeof(struct config_section), sections, i);
 
 		if (astrcmpi(sec->name, section) != 0)
 			continue;
 
 		for (size_t j = 0; j < sec->items.num; j++) {
 			struct config_item *item = darray_item(
-					sizeof(struct config_item),
-					&sec->items, j);
+				sizeof(struct config_item), &sec->items, j);
 
 			if (astrcmpi(item->name, name) == 0) {
 				config_item_free(item);
 				darray_erase(sizeof(struct config_item),
-						&sec->items, j);
-				return true;
+					     &sec->items, j);
+				success = true;
+				goto unlock;
 			}
 		}
 	}
 
-	return false;
+unlock:
+	pthread_mutex_unlock(&config->mutex);
+	return success;
 }
 
-const char *config_get_default_string(const config_t *config,
-		const char *section, const char *name)
+const char *config_get_default_string(config_t *config, const char *section,
+				      const char *name)
 {
 	const struct config_item *item;
+	const char *value = NULL;
+
+	pthread_mutex_lock(&config->mutex);
 
 	item = config_find_item(&config->defaults, section, name);
-	if (!item)
-		return NULL;
+	if (item)
+		value = item->value;
 
-	return item->value;
+	pthread_mutex_unlock(&config->mutex);
+	return value;
 }
 
-int64_t config_get_default_int(const config_t *config, const char *section,
-		const char *name)
+int64_t config_get_default_int(config_t *config, const char *section,
+			       const char *name)
 {
 	const char *value = config_get_default_string(config, section, name);
 	if (value)
@@ -736,8 +812,8 @@ int64_t config_get_default_int(const config_t *config, const char *section,
 	return 0;
 }
 
-uint64_t config_get_default_uint(const config_t *config, const char *section,
-		const char *name)
+uint64_t config_get_default_uint(config_t *config, const char *section,
+				 const char *name)
 {
 	const char *value = config_get_default_string(config, section, name);
 	if (value)
@@ -746,19 +822,18 @@ uint64_t config_get_default_uint(const config_t *config, const char *section,
 	return 0;
 }
 
-bool config_get_default_bool(const config_t *config, const char *section,
-		const char *name)
+bool config_get_default_bool(config_t *config, const char *section,
+			     const char *name)
 {
 	const char *value = config_get_default_string(config, section, name);
 	if (value)
-		return astrcmpi(value, "true") == 0 ||
-		       !!str_to_uint64(value);
+		return astrcmpi(value, "true") == 0 || !!str_to_uint64(value);
 
 	return false;
 }
 
-double config_get_default_double(const config_t *config, const char *section,
-		const char *name)
+double config_get_default_double(config_t *config, const char *section,
+				 const char *name)
 {
 	const char *value = config_get_default_string(config, section, name);
 	if (value)
@@ -767,15 +842,22 @@ double config_get_default_double(const config_t *config, const char *section,
 	return 0.0;
 }
 
-bool config_has_user_value(const config_t *config, const char *section,
-		const char *name)
+bool config_has_user_value(config_t *config, const char *section,
+			   const char *name)
 {
-	return config_find_item(&config->sections, section, name) != NULL;
+	bool success;
+	pthread_mutex_lock(&config->mutex);
+	success = config_find_item(&config->sections, section, name) != NULL;
+	pthread_mutex_unlock(&config->mutex);
+	return success;
 }
 
-bool config_has_default_value(const config_t *config, const char *section,
-		const char *name)
+bool config_has_default_value(config_t *config, const char *section,
+			      const char *name)
 {
-	return config_find_item(&config->defaults, section, name) != NULL;
+	bool success;
+	pthread_mutex_lock(&config->mutex);
+	success = config_find_item(&config->defaults, section, name) != NULL;
+	pthread_mutex_unlock(&config->mutex);
+	return success;
 }
-

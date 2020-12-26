@@ -19,7 +19,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 #include <jack/jack.h>
 #include <obs.h>
-#include <pthread.h>
+#include <util/threading.h>
 
 struct jack_data {
 	obs_source_t *source;
@@ -43,9 +43,9 @@ struct jack_data {
 /**
  * Initialize the jack client and register the ports
  */
-int_fast32_t jack_init(struct jack_data* data);
+int_fast32_t jack_init(struct jack_data *data);
 
 /**
  * Destroys the jack client and unregisters the ports
  */
-void deactivate_jack(struct jack_data* data);
+void deactivate_jack(struct jack_data *data);

@@ -14,7 +14,6 @@ include_directories(${COREAUDIO}
 
 set(mac-capture_HEADERS
 	audio-device-enum.h
-	mac-helpers.h
 	window-utils.h)
 
 set(mac-capture_SOURCES
@@ -24,11 +23,6 @@ set(mac-capture_SOURCES
 	mac-display-capture.m
 	mac-window-capture.m
 	window-utils.m)
-	
-set_source_files_properties(mac-display-capture.m
-			    mac-window-capture.m
-			    window-utils.m
-	PROPERTIES LANGUAGE C)
 
 add_library(mac-capture MODULE
 	${mac-capture_SOURCES}
@@ -40,5 +34,6 @@ target_link_libraries(mac-capture
 	${COREFOUNDATION}
 	${IOSURF}
 	${COCOA})
+set_target_properties(mac-capture PROPERTIES FOLDER "plugins")
 
 install_obs_plugin_with_data(mac-capture data)

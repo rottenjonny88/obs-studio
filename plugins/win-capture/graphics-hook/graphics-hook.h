@@ -1,8 +1,10 @@
 #pragma once
 
+#include "graphics-hook-config.h"
+
 #ifdef _MSC_VER
 /* conversion from data/function pointer */
-#pragma warning(disable: 4152)
+#pragma warning(disable : 4152)
 #endif
 
 #include "../graphics-hook-info.h"
@@ -26,6 +28,9 @@ static inline HMODULE get_system_module(const char *module);
 static inline HMODULE load_system_library(const char *module);
 extern uint64_t os_gettime_ns(void);
 
+#define flog(format, ...) hlog("%s: " format, __FUNCTION__, ##__VA_ARGS__)
+#define flog_hr(text, hr) hlog_hr(__FUNCTION__ ": " text, hr)
+
 static inline bool capture_active(void);
 static inline bool capture_ready(void);
 static inline bool capture_should_stop(void);
@@ -40,23 +45,28 @@ extern bool hook_d3d8(void);
 extern bool hook_d3d9(void);
 extern bool hook_dxgi(void);
 extern bool hook_gl(void);
+#if COMPILE_VULKAN_HOOK
+extern bool hook_vulkan(void);
+#endif
 
-extern void d3d10_capture(void *swap, void *backbuffer);
+extern void d3d10_capture(void *swap, void *backbuffer, bool capture_overlay);
 extern void d3d10_free(void);
-extern void d3d11_capture(void *swap, void *backbuffer);
+extern void d3d11_capture(void *swap, void *backbuffer, bool capture_overlay);
 extern void d3d11_free(void);
 
-extern uint8_t *get_d3d1x_vertex_shader(size_t *size);
-extern uint8_t *get_d3d1x_pixel_shader(size_t *size);
+#if COMPILE_D3D12_HOOK
+extern void d3d12_capture(void *swap, void *backbuffer, bool capture_overlay);
+extern void d3d12_free(void);
+#endif
 
 extern bool rehook_gl(void);
 
 extern bool capture_init_shtex(struct shtex_data **data, HWND window,
-		uint32_t base_cx, uint32_t base_cy, uint32_t cx, uint32_t cy,
-		uint32_t format, bool flip, uintptr_t handle);
+			       uint32_t cx, uint32_t cy, uint32_t format,
+			       bool flip, uintptr_t handle);
 extern bool capture_init_shmem(struct shmem_data **data, HWND window,
-		uint32_t base_cx, uint32_t base_cy, uint32_t cx, uint32_t cy,
-		uint32_t pitch, uint32_t format, bool flip);
+			       uint32_t cx, uint32_t cy, uint32_t pitch,
+			       uint32_t format, bool flip);
 extern void capture_free(void);
 
 extern struct hook_info *global_hook_info;
@@ -73,12 +83,12 @@ struct vertex {
 static inline bool duplicate_handle(HANDLE *dst, HANDLE src)
 {
 	return !!DuplicateHandle(GetCurrentProcess(), src, GetCurrentProcess(),
-			dst, 0, false, DUPLICATE_SAME_ACCESS);
+				 dst, 0, false, DUPLICATE_SAME_ACCESS);
 }
 
 static inline void *get_offset_addr(HMODULE module, uint32_t offset)
 {
-	return (void*)((uintptr_t)module + (uintptr_t)offset);
+	return (void *)((uintptr_t)module + (uintptr_t)offset);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -91,7 +101,7 @@ extern HANDLE signal_exit;
 extern HANDLE tex_mutexes[2];
 extern char system_path[MAX_PATH];
 extern char process_name[MAX_PATH];
-extern char keepalive_name[64];
+extern wchar_t keepalive_name[64];
 extern HWND dummy_window;
 extern volatile bool active;
 
@@ -114,7 +124,7 @@ static inline uint32_t module_size(HMODULE module)
 {
 	MODULEINFO info;
 	bool success = !!GetModuleInformation(GetCurrentProcess(), module,
-			&info, sizeof(info));
+					      &info, sizeof(info));
 	return success ? info.SizeOfImage : 0;
 }
 
@@ -136,13 +146,11 @@ static inline HMODULE load_system_library(const char *name)
 
 static inline bool capture_alive(void)
 {
-	HANDLE event = OpenEventA(EVENT_ALL_ACCESS, false, keepalive_name);
-	if (event) {
-		CloseHandle(event);
-		return true;
-	}
-
-	return false;
+	HANDLE handle = OpenMutexW(SYNCHRONIZE, false, keepalive_name);
+	const bool success = handle != NULL;
+	if (success)
+		CloseHandle(handle);
+	return success;
 }
 
 static inline bool capture_active(void)
@@ -153,8 +161,8 @@ static inline bool capture_active(void)
 static inline bool frame_ready(uint64_t interval)
 {
 	static uint64_t last_time = 0;
-	uint64_t        elapsed;
-	uint64_t        t;
+	uint64_t elapsed;
+	uint64_t t;
 
 	if (!interval) {
 		return true;
@@ -174,7 +182,7 @@ static inline bool frame_ready(uint64_t interval)
 static inline bool capture_ready(void)
 {
 	return capture_active() &&
-		frame_ready(global_hook_info->frame_interval);
+	       frame_ready(global_hook_info->frame_interval);
 }
 
 static inline bool capture_stopped(void)
@@ -191,8 +199,18 @@ static inline bool capture_should_stop(void)
 {
 	bool stop_requested = false;
 
-	if (capture_active())
-		stop_requested = capture_stopped() || !capture_alive();
+	if (capture_active()) {
+		static uint64_t last_keepalive_check = 0;
+		uint64_t cur_time = os_gettime_ns();
+		bool alive = true;
+
+		if (cur_time - last_keepalive_check > 5000000000) {
+			alive = capture_alive();
+			last_keepalive_check = cur_time;
+		}
+
+		stop_requested = capture_stopped() || !alive;
+	}
 
 	return stop_requested;
 }
